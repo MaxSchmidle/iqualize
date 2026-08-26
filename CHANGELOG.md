@@ -2,6 +2,11 @@
 
 All notable changes to iQualize will be documented in this file.
 
+## [0.60.1] - 2026-08-17
+
+### Fixed
+- The EQ editor now keeps foreground spectrum updates at 60 Hz while pausing periodic UI rendering when backgrounded, minimized, occluded, or closed. Static graph elements no longer redraw on every spectrum frame (#102).
+
 ## [0.60.0] - 2026-08-03
 
 ### Added

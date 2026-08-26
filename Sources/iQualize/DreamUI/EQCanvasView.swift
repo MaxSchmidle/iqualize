@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @available(macOS 14.2, *)
@@ -10,21 +11,41 @@ struct EQCanvasView: View {
     /// Class-based scratchpad held by reference so we don't mutate @State inside Canvas's body.
     @State private var scratch = CanvasScratch()
     @State private var dragState: DragState?
+    @State private var windowIsForeground = false
 
     var body: some View {
         GeometryReader { proxy in
             ZStack {
-                TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { context in
-                    Canvas(rendersAsynchronously: false) { ctx, size in
-                        let phase = context.date.timeIntervalSinceReferenceDate
-                        // Pull fresh spectrum into the scratchpad each frame.
-                        scratch.refreshSpectra(
-                            preEq: vm.audioEngine.preEqAnalyzer.spectrumData,
-                            postEq: vm.audioEngine.postEqAnalyzer.spectrumData,
-                            engineRunning: vm.audioEngine.isRunning
-                        )
-                        draw(into: &ctx, size: size, phase: phase)
+                // Only the spectrum trace is time-varying. Keeping the grid, labels, band
+                // responses, and knobs outside TimelineView avoids rebuilding the entire graph
+                // for every spectrum frame.
+                if EQCanvasRenderPolicy.shouldAnimate(
+                    windowForeground: windowIsForeground,
+                    engineRunning: vm.audioEngine.isRunning,
+                    preEqEnabled: vm.preEqEnabled,
+                    postEqEnabled: vm.postEqEnabled,
+                    bypassed: vm.bypass
+                ) {
+                    TimelineView(.periodic(
+                        from: .now,
+                        by: EQCanvasRenderPolicy.spectrumFrameInterval
+                    )) { _ in
+                        Canvas(rendersAsynchronously: false) { ctx, size in
+                            scratch.refreshSpectra(
+                                preEq: vm.audioEngine.preEqAnalyzer.spectrumData,
+                                postEq: vm.audioEngine.postEqAnalyzer.spectrumData,
+                                engineRunning: vm.audioEngine.isRunning,
+                                readPreEq: vm.preEqEnabled,
+                                readPostEq: vm.postEqEnabled && !vm.bypass
+                            )
+                            drawSpectra(into: &ctx, size: size)
+                        }
                     }
+                    .allowsHitTesting(false)
+                }
+
+                Canvas(rendersAsynchronously: false) { ctx, size in
+                    drawStatic(into: &ctx, size: size)
                 }
                 .allowsHitTesting(false)
 
@@ -41,6 +62,49 @@ struct EQCanvasView: View {
             .clipped()
         }
         .frame(maxWidth: .infinity, minHeight: 380, idealHeight: 380, maxHeight: .infinity)
+        .onAppear(perform: updateWindowForegroundState)
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+            updateWindowForegroundState(for: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            updateWindowForegroundState(for: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
+            updateWindowForegroundState(for: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didDeminiaturizeNotification)) { note in
+            updateWindowForegroundState(for: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMiniaturizeNotification)) { note in
+            updateWindowForegroundState(for: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            updateWindowForegroundState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            windowIsForeground = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            guard (note.object as? NSWindow) === vm.window else { return }
+            windowIsForeground = false
+        }
+    }
+
+    private func updateWindowForegroundState(for note: Notification) {
+        guard (note.object as? NSWindow) === vm.window else { return }
+        updateWindowForegroundState()
+    }
+
+    private func updateWindowForegroundState() {
+        guard let window = vm.window else {
+            windowIsForeground = false
+            return
+        }
+        windowIsForeground = NSApp.isActive
+            && window.isKeyWindow
+            && window.isVisible
+            && !window.isMiniaturized
+            && window.occlusionState.contains(.visible)
     }
 
     // MARK: - Zoom control
@@ -111,7 +175,7 @@ struct EQCanvasView: View {
 
     // MARK: - Drawing
 
-    private func draw(into ctx: inout GraphicsContext, size: CGSize, phase: Double) {
+    private func drawStatic(into ctx: inout GraphicsContext, size: CGSize) {
         let W = size.width, H = size.height
         let isLight = theme.scheme == .light
         let (ir, ig, ib) = theme.inkRGB
@@ -214,14 +278,6 @@ struct EQCanvasView: View {
             ])
             let rect = CGRect(x: sx - colW, y: 0, width: colW * 2, height: H)
             ctx.fill(Path(rect), with: .linearGradient(g, startPoint: CGPoint(x: rect.minX, y: 0), endPoint: CGPoint(x: rect.maxX, y: 0)))
-        }
-
-        // Real pre/post-EQ spectrum (only if engine is running and toggle is on)
-        if vm.audioEngine.isRunning && vm.preEqEnabled {
-            drawRealSpectrum(into: &ctx, size: size, mags: scratch.preEqMags, color: vm.preEqLineColor, fillColor: vm.preEqFillEnabled ? vm.preEqFillColor.opacity(0.18) : nil, displayMax: displayMax)
-        }
-        if vm.audioEngine.isRunning && vm.postEqEnabled && !vm.bypass {
-            drawRealSpectrum(into: &ctx, size: size, mags: scratch.postEqMags, color: vm.postEqLineColor, fillColor: vm.postEqFillEnabled ? vm.postEqFillColor.opacity(0.18) : nil, displayMax: displayMax)
         }
 
         // Per-band ghost responses
@@ -360,6 +416,30 @@ struct EQCanvasView: View {
                     .foregroundStyle(theme.bandwidthAccent.opacity(opacity))
                 ctx.draw(bwView, at: CGPoint(x: x, y: y - knobR - 8), anchor: .center)
             }
+        }
+    }
+
+    private func drawSpectra(into ctx: inout GraphicsContext, size: CGSize) {
+        let displayMax = computeDisplayMax(bands: vm.displayBands, W: size.width)
+        if vm.preEqEnabled {
+            drawRealSpectrum(
+                into: &ctx,
+                size: size,
+                mags: scratch.preEqMags,
+                color: vm.preEqLineColor,
+                fillColor: vm.preEqFillEnabled ? vm.preEqFillColor.opacity(0.18) : nil,
+                displayMax: displayMax
+            )
+        }
+        if vm.postEqEnabled && !vm.bypass {
+            drawRealSpectrum(
+                into: &ctx,
+                size: size,
+                mags: scratch.postEqMags,
+                color: vm.postEqLineColor,
+                fillColor: vm.postEqFillEnabled ? vm.postEqFillColor.opacity(0.18) : nil,
+                displayMax: displayMax
+            )
         }
     }
 
@@ -867,20 +947,30 @@ final class CanvasScratch {
     private var peaksScratch: [Float] = Array(repeating: -90, count: SpectrumData.binCount)
     private var scrollCommitTask: Task<Void, Never>?
 
-    func refreshSpectra(preEq: SpectrumData, postEq: SpectrumData, engineRunning: Bool) {
+    func refreshSpectra(
+        preEq: SpectrumData,
+        postEq: SpectrumData,
+        engineRunning: Bool,
+        readPreEq: Bool,
+        readPostEq: Bool
+    ) {
         guard engineRunning else {
             for i in preEqMags.indices { preEqMags[i] = -90 }
             for i in postEqMags.indices { postEqMags[i] = -90 }
             return
         }
-        preEqMags.withUnsafeMutableBufferPointer { mags in
-            peaksScratch.withUnsafeMutableBufferPointer { peaks in
-                preEq.read(mags.baseAddress!, peaks: peaks.baseAddress!)
+        if readPreEq {
+            preEqMags.withUnsafeMutableBufferPointer { mags in
+                peaksScratch.withUnsafeMutableBufferPointer { peaks in
+                    preEq.read(mags.baseAddress!, peaks: peaks.baseAddress!)
+                }
             }
         }
-        postEqMags.withUnsafeMutableBufferPointer { mags in
-            peaksScratch.withUnsafeMutableBufferPointer { peaks in
-                postEq.read(mags.baseAddress!, peaks: peaks.baseAddress!)
+        if readPostEq {
+            postEqMags.withUnsafeMutableBufferPointer { mags in
+                peaksScratch.withUnsafeMutableBufferPointer { peaks in
+                    postEq.read(mags.baseAddress!, peaks: peaks.baseAddress!)
+                }
             }
         }
     }
