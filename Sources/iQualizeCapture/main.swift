@@ -314,6 +314,15 @@ func readTapFormat(_ tap: AudioObjectID, _ format: inout AudioStreamBasicDescrip
     return AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &format)
 }
 
+/// The IOProc copy loop and the app's reader both assume interleaved Float32;
+/// the global tap is that by contract, a device tap only if its stream is.
+func isInterleavedFloat32(_ format: AudioStreamBasicDescription) -> Bool {
+    format.mFormatID == kAudioFormatLinearPCM
+        && format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        && format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        && format.mBitsPerChannel == 32
+}
+
 /// A muted tap on the first output stream of `deviceUID`, reporting that
 /// stream's own format, or nil if Core Audio refuses it.
 @available(macOS 14.2, *)
@@ -397,13 +406,14 @@ func run() {
         stage: .tapFormat, "Failed to read tap format", exitCode: 11
     )
 
-    // 3b. The global tap always reports 48 kHz. When the app offers its output
+    // 3b. The global tap reports one fixed rate (48 kHz as measured). When the app offers its output
     //     device and that device runs stereo at another rate, tap the device
     //     directly so its audio arrives unconverted (CaptureTapChoice). Any
     //     failure keeps the global tap.
     if let deviceUID = CaptureTapChoice.deviceUID(fromArguments: CommandLine.arguments),
        let device = createDeviceTap(deviceUID: deviceUID, excluding: excluded) {
-        if CaptureTapChoice.prefersDeviceTap(globalSampleRate: tapFormat.mSampleRate,
+        if isInterleavedFloat32(device.format),
+           CaptureTapChoice.prefersDeviceTap(globalSampleRate: tapFormat.mSampleRate,
                                              deviceSampleRate: device.format.mSampleRate,
                                              deviceChannels: device.format.mChannelsPerFrame) {
             AudioHardwareDestroyProcessTap(tapID)

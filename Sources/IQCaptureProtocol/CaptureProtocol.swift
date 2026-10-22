@@ -274,8 +274,8 @@ public struct CaptureGeometry: Equatable, Sendable {
 // MARK: - Tap choice
 
 /// How the app asks the helper for a device-bound tap, and when the helper
-/// takes it. A stereo global tap always reports 48 kHz whatever the output
-/// device runs at, so on a 44.1 kHz device every sample was converted to
+/// takes it. A stereo global tap reports one fixed rate (48 kHz on every
+/// configuration measured) whatever the output device runs at, so on a 44.1 kHz device every sample was converted to
 /// 48 kHz and back. A tap bound to the device's first output stream reports
 /// that stream's own format instead.
 public enum CaptureTapChoice {

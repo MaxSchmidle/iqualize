@@ -144,7 +144,20 @@ final class CaptureClient: @unchecked Sendable {
     /// Throws if anything fails — caller should treat as a hard error.
     /// `deviceUID` offers the helper a device-bound tap on that output device
     /// (see CaptureTapChoice); the handshake reports which format it chose.
+    /// A helper that fails to start with the offer is relaunched without it,
+    /// so a device whose direct tap breaks still gets the global tap.
     func start(helperURL: URL, deviceUID: String? = nil) throws {
+        do {
+            try launch(helperURL: helperURL, deviceUID: deviceUID)
+        } catch CaptureClientError.helperStartupFailed(let failure) where deviceUID != nil {
+            os_log(.error, log: clientLog,
+                   "capture helper failed with a device tap (stage %{public}@); retrying with the global tap",
+                   failure.stage.rawValue)
+            try launch(helperURL: helperURL, deviceUID: nil)
+        }
+    }
+
+    private func launch(helperURL: URL, deviceUID: String?) throws {
         guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
             throw CaptureClientError.helperMissing(path: helperURL.path)
         }
@@ -159,9 +172,11 @@ final class CaptureClient: @unchecked Sendable {
         proc.standardOutput = stdoutPipe
         proc.standardInput = stdinPipe
         // Leave stderr inherited so helper errors land in iQualize's log.
-        proc.terminationHandler = { [weak self] _ in
+        proc.terminationHandler = { [weak self] terminated in
             guard let self else { return }
-            if self.intentionallyStopping { return }
+            // A helper released by stop() can report its exit after start()
+            // has relaunched; only the current helper's exit is unexpected.
+            if self.intentionallyStopping || self.process !== terminated { return }
             os_log(.error, log: clientLog,
                    "capture helper terminated unexpectedly")
             Task { @MainActor in

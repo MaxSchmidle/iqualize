@@ -69,32 +69,49 @@ final class CaptureTapChoiceTests: XCTestCase {
 
     // MARK: - Across the process boundary
 
-    /// Starts CaptureClient against a stand-in helper that records its argv and
-    /// never handshakes, and returns the device UID the helper would parse.
-    private func uidSeenByHelper(offering deviceUID: String?) throws -> String? {
+    /// Starts CaptureClient against a stand-in helper that appends its argv to
+    /// a log, one line per launch, then either reports `failureWithDevice`
+    /// when offered a device or never handshakes. Returns the device UID each
+    /// launch would parse.
+    private func uidsSeenByHelper(offering deviceUID: String?,
+                                  failureWithDevice: CaptureStartupFailure? = nil) throws -> [String?] {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("iqualize-tapchoice-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let argsFile = dir.appendingPathComponent("args")
+        let launchLog = dir.appendingPathComponent("launches")
         let helper = dir.appendingPathComponent("helper.sh")
-        try "#!/bin/sh\nprintf '%s\\n' \"$@\" > '\(argsFile.path)'\nsleep 30\n"
-            .write(to: helper, atomically: true, encoding: .utf8)
+        var script = "#!/bin/sh\necho \"$*\" >> '\(launchLog.path)'\n"
+        if let failureWithDevice {
+            let line = String(decoding: try failureWithDevice.encodedLine(), as: UTF8.self)
+                .trimmingCharacters(in: .newlines)
+            script += "[ \"$1\" = \(CaptureTapChoice.deviceUIDArgument) ] && { printf '%s\\n' '\(line)'; exit \(failureWithDevice.exitCode); }\n"
+        }
+        script += "exec sleep 30\n"
+        try script.write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
 
-        let client = CaptureClient(handshakeTimeoutNanoseconds: 300_000_000)
+        let client = CaptureClient(handshakeTimeoutNanoseconds: 1_000_000_000)
         XCTAssertThrowsError(try client.start(helperURL: helper, deviceUID: deviceUID))
-        let recorded = (try? String(contentsOf: argsFile, encoding: .utf8)) ?? ""
-        let arguments = recorded.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        return CaptureTapChoice.deviceUID(fromArguments: [helper.path] + arguments)
+        let launches = try String(contentsOf: launchLog, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false).dropLast()
+        return launches.map { line in
+            CaptureTapChoice.deviceUID(fromArguments: [helper.path] + line.split(separator: " ").map(String.init))
+        }
     }
 
     func testClientHandsTheOfferedDeviceToTheHelper() throws {
-        XCTAssertEqual(try uidSeenByHelper(offering: "BuiltInHeadphoneOutputDevice"),
-                       "BuiltInHeadphoneOutputDevice")
+        XCTAssertEqual(try uidsSeenByHelper(offering: "BuiltInHeadphoneOutputDevice"),
+                       ["BuiltInHeadphoneOutputDevice"])
     }
 
     func testClientOffersNoDeviceWhenNoneIsEligible() throws {
-        XCTAssertNil(try uidSeenByHelper(offering: nil))
+        XCTAssertEqual(try uidsSeenByHelper(offering: nil), [nil])
+    }
+
+    func testClientFallsBackToTheGlobalTapWhenTheDeviceTapFails() throws {
+        let failure = CaptureStartupFailure(stage: .aggregateDevice, exitCode: 12, osStatus: -50)
+        XCTAssertEqual(try uidsSeenByHelper(offering: "BuiltInHeadphoneOutputDevice", failureWithDevice: failure),
+                       ["BuiltInHeadphoneOutputDevice", nil])
     }
 }
