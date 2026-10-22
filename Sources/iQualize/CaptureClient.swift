@@ -142,13 +142,18 @@ final class CaptureClient: @unchecked Sendable {
 
     /// Launches the helper, reads the handshake, maps its shared memory.
     /// Throws if anything fails — caller should treat as a hard error.
-    func start(helperURL: URL) throws {
+    /// `deviceUID` offers the helper a device-bound tap on that output device
+    /// (see CaptureTapChoice); the handshake reports which format it chose.
+    func start(helperURL: URL, deviceUID: String? = nil) throws {
         guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
             throw CaptureClientError.helperMissing(path: helperURL.path)
         }
 
         let proc = Process()
         proc.executableURL = helperURL
+        if let deviceUID {
+            proc.arguments = [CaptureTapChoice.deviceUIDArgument, deviceUID]
+        }
         let stdoutPipe = Pipe()
         let stdinPipe = Pipe()
         proc.standardOutput = stdoutPipe
